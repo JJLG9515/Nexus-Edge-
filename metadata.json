@@ -1,0 +1,6 @@
+{
+  "name": "Nexus Edge",
+  "description": "Asistente de inteligencia artificial personal, local-first y multimodal optimizado para Motorola Edge 50 Pro.",
+  "requestFramePermissions": ["camera", "microphone", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
