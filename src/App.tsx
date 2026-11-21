@@ -20,11 +20,12 @@ import type {
   VaultExport,
 } from './types';
 import {
-  buildAdaptiveSystemPrompt,
   createSeedMemories,
   DEFAULT_PROFILE,
   mergeLearnedMemories,
 } from './utils/memoryEngine';
+import { runWebResearch } from './utils/webResearcher';
+import { extractLocalInsights } from './utils/localLearner';
 import { useLocalStorageState } from './hooks/useLocalStorageState';
 import { useDeviceHardware } from './hooks/useDeviceHardware';
 import { ChatWorkspace } from './components/ChatWorkspace';
@@ -151,30 +152,46 @@ export default function App() {
   );
 
   const runAutonomousLearning = useCallback(
-    async (sessionId: string, assistantMsgId: string, userText: string, assistantText: string) => {
-      if (!profile.autoLearn || !userText.trim() || !assistantText.trim()) return;
+    async (sessionId: string, assistantMsgId: string, userText: string) => {
+      if (!profile.autoLearn || !userText.trim()) return;
       try {
-        const res = await fetch('/api/learn', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userMessage: userText,
-            assistantMessage: assistantText,
-            existingMemories: memories.slice(0, 20).map((m) => ({
-              category: m.category,
-              content: m.content,
-            })),
-          }),
-        });
-        if (!res.ok) return;
-        const data = (await res.json()) as {
-          insights?: Array<{ category: MemoryCategory; content: string; confidence: number }>;
-        };
-        if (!data.insights || data.insights.length === 0) return;
+        let insights = extractLocalInsights(
+          userText,
+          memories.slice(0, 20).map((m) => ({
+            category: m.category,
+            content: m.content,
+          }))
+        );
+
+        if (insights.length === 0) {
+          try {
+            const res = await fetch('/api/learn', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                userMessage: userText,
+                existingMemories: memories.slice(0, 20).map((m) => ({
+                  category: m.category,
+                  content: m.content,
+                })),
+              }),
+            });
+            if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
+              const data = (await res.json()) as {
+                insights?: Array<{ category: MemoryCategory; content: string; confidence: number }>;
+              };
+              insights = data.insights ?? [];
+            }
+          } catch {
+            // Local extraction already handled offline/standalone mode
+          }
+        }
+
+        if (insights.length === 0) return;
 
         let learnedLabels: string[] = [];
         setMemories((prev) => {
-          const merged = mergeLearnedMemories(prev, data.insights || []);
+          const merged = mergeLearnedMemories(prev, insights);
           learnedLabels = merged.addedOrUpdated.map((item) => item.content);
           return merged.memories;
         });
@@ -194,7 +211,7 @@ export default function App() {
           );
         }
       } catch {
-        // Silent fallback if offline or learn endpoint unavailable
+        // Ignore learning error cleanly
       }
     },
     [profile.autoLearn, memories, setMemories, setSessions]
@@ -250,86 +267,109 @@ export default function App() {
       const startedAt = performance.now();
 
       try {
-        const systemInstruction = buildAdaptiveSystemPrompt(profile, memories, snapshot);
-        const response = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: text,
-            history: priorHistory,
-            systemInstruction,
-            thinkingDepth,
-            webSearch,
-            image: attachment
-              ? { mimeType: attachment.mimeType, base64Data: attachment.base64Data }
-              : null,
-          }),
-        });
-
-        if (!response.ok || !response.body) {
-          throw new Error(`Error del servidor (${response.status})`);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
         let accumulatedText = '';
         let finalSources: GroundingSource[] = [];
         let streamError: string | null = null;
+        let usedServerStream = false;
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
+        try {
+          const response = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              message: text,
+              history: priorHistory,
+              profile,
+              memories,
+              thinkingDepth,
+              webSearch,
+              image: attachment
+                ? { mimeType: attachment.mimeType, base64Data: attachment.base64Data }
+                : null,
+            }),
+          });
 
-          const events = buffer.split('\n\n');
-          buffer = events.pop() ?? '';
+          const contentType = response.headers.get('content-type') || '';
+          if (response.ok && response.body && contentType.includes('text/event-stream')) {
+            usedServerStream = true;
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
 
-          for (const rawEvent of events) {
-            const lines = rawEvent.split('\n');
-            let eventName = 'message';
-            let dataStr = '';
-            for (const line of lines) {
-              if (line.startsWith('event: ')) eventName = line.slice(7).trim();
-              if (line.startsWith('data: ')) dataStr += line.slice(6);
-            }
-            if (!dataStr) continue;
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
 
-            try {
-              const payload = JSON.parse(dataStr) as {
-                text?: string;
-                fullText?: string;
-                sources?: GroundingSource[];
-                message?: string;
-              };
-              if (eventName === 'chunk' && payload.text) {
-                accumulatedText += payload.text;
-                setSessions((prev) =>
-                  prev.map((s) =>
-                    s.id !== targetSessionId
-                      ? s
-                      : {
-                          ...s,
-                          messages: s.messages.map((m) =>
-                            m.id === assistantMsgId ? { ...m, content: accumulatedText } : m
-                          ),
-                        }
-                  )
-                );
-              } else if (eventName === 'done') {
-                if (typeof payload.fullText === 'string' && payload.fullText.length > 0) {
-                  accumulatedText = payload.fullText;
+              const events = buffer.split('\n\n');
+              buffer = events.pop() ?? '';
+
+              for (const rawEvent of events) {
+                const lines = rawEvent.split('\n');
+                let eventName = 'message';
+                let dataStr = '';
+                for (const line of lines) {
+                  if (line.startsWith('event: ')) eventName = line.slice(7).trim();
+                  if (line.startsWith('data: ')) dataStr += line.slice(6);
                 }
-                if (Array.isArray(payload.sources)) {
-                  finalSources = payload.sources;
+                if (!dataStr) continue;
+
+                try {
+                  const payload = JSON.parse(dataStr) as {
+                    text?: string;
+                    fullText?: string;
+                    sources?: GroundingSource[];
+                    message?: string;
+                  };
+                  if (eventName === 'chunk' && payload.text) {
+                    accumulatedText += payload.text;
+                    setSessions((prev) =>
+                      prev.map((s) =>
+                        s.id !== targetSessionId
+                          ? s
+                          : {
+                              ...s,
+                              messages: s.messages.map((m) =>
+                                m.id === assistantMsgId ? { ...m, content: accumulatedText } : m
+                              ),
+                            }
+                      )
+                    );
+                  } else if (eventName === 'done') {
+                    if (typeof payload.fullText === 'string' && payload.fullText.length > 0) {
+                      accumulatedText = payload.fullText;
+                    }
+                    if (Array.isArray(payload.sources)) {
+                      finalSources = payload.sources;
+                    }
+                  } else if (eventName === 'error') {
+                    streamError = payload.message || 'Error en la investigación web.';
+                  }
+                } catch {
+                  // Ignore malformed partial SSE line
                 }
-              } else if (eventName === 'error') {
-                streamError = payload.message || 'Error inesperado en el motor Gemini.';
               }
-            } catch {
-              // Ignore malformed partial SSE line
             }
           }
+        } catch {
+          // Backend server not reachable (e.g. standalone APK without server.url); fall back to client CORS live web research
+        }
+
+        if (!usedServerStream) {
+          const clientResearch = await runWebResearch({
+            query: text || 'Investigación web en vivo',
+            depth: thinkingDepth,
+            webEnabled: webSearch,
+            profile,
+            memories,
+            allowDirectUrlFetch: false,
+          });
+          accumulatedText = clientResearch.markdown;
+          finalSources = clientResearch.sources;
+        }
+
+        if (!streamError && !accumulatedText.trim()) {
+          streamError = 'No se obtuvieron resultados para esta consulta.';
         }
 
         const latencyMs = Math.round(performance.now() - startedAt);
@@ -356,7 +396,7 @@ export default function App() {
         );
 
         if (!streamError && accumulatedText) {
-          void runAutonomousLearning(targetSessionId, assistantMsgId, text, accumulatedText);
+          void runAutonomousLearning(targetSessionId, assistantMsgId, text);
         }
       } catch (err: unknown) {
         const message =
@@ -462,8 +502,8 @@ export default function App() {
 
   return (
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-[#07080A] text-[#E8ECEF]">
-      {/* Top Bar: 3-zone contract on desktop, compact 56px bar on mobile */}
-      <header className="h-14 shrink-0 border-b border-white/[0.08] bg-[#07080A]/95 backdrop-blur-md px-4 lg:px-6 flex items-center justify-between gap-8">
+      {/* Top Bar: 3-zone contract on desktop, safe-area aware compact bar on mobile */}
+      <header className="min-h-14 pt-[env(safe-area-inset-top)] shrink-0 border-b border-white/[0.08] bg-[#07080A]/95 backdrop-blur-md px-4 lg:px-6 py-1.5 flex items-center justify-between gap-8">
         <a
           href="#top"
           onClick={(e) => {

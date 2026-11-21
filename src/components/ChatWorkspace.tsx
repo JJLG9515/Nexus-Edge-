@@ -48,20 +48,20 @@ interface ChatWorkspaceProps {
 
 const STARTER_PROMPTS = [
   {
-    title: 'Síntesis técnica y estrategia',
-    prompt: 'Analiza los principios arquitectónicos para una app Android offline-first con sincronización local.',
+    title: 'Definición y contexto en vivo',
+    prompt: '¿Qué significa comer?',
   },
   {
-    title: 'Investigación web en vivo',
-    prompt: 'Busca las novedades recientes sobre optimización de baterías y pantallas pOLED de 144Hz en smartphones.',
+    title: 'Clima en tiempo real',
+    prompt: '¿Cuál es el clima en Ciudad de México?',
   },
   {
-    title: 'Razonamiento multidisciplinario',
-    prompt: 'Combina teoría de sistemas, economía conductual y diseño de producto para priorizar hábitos de alto impacto.',
+    title: 'Investigación técnica web',
+    prompt: 'Investiga Capacitor Android y pOLED 144Hz en smartphones.',
   },
   {
     title: 'Calibrar memoria personal',
-    prompt: 'Recuerda que prefiero explicaciones técnicas directas, ejemplos reproducibles y resúmenes en 3 puntos clave.',
+    prompt: 'Recuerda que prefiero explicaciones técnicas directas y resúmenes en 3 puntos clave.',
   },
 ];
 

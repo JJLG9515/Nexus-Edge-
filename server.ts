@@ -2,51 +2,24 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import type { MemoryItem, ThinkingDepth, UserProfile } from './src/types.ts';
+import { DEFAULT_PROFILE, buildAdaptiveSystemPrompt } from './src/utils/memoryEngine.ts';
+import { runWebResearch } from './src/utils/webResearcher.ts';
+import { extractLocalInsights } from './src/utils/localLearner.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
-
-function getAiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      'GEMINI_API_KEY no está configurada. Agrega tu clave en Settings > Secrets para activar el motor Gemini.'
-    );
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-}
-
-function mapThinkingDepth(depth: unknown): ThinkingLevel {
-  if (depth === 'fast') return ThinkingLevel.LOW;
-  if (depth === 'deep') return ThinkingLevel.XHIGH;
-  return ThinkingLevel.HIGH;
-}
-
-function extractUrls(text: string): string[] {
-  const matches = text.match(/https?:\/\/[^\s<>)"']+/gi) ?? [];
-  return Array.from(new Set(matches.map((u) => u.replace(/[.,;!?]+$/, '')))).slice(0, 20);
-}
-
-interface IncomingHistoryItem {
-  role: 'user' | 'assistant';
-  content: string;
-}
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || '';
 
 interface ChatRequestBody {
   message: string;
-  history?: IncomingHistoryItem[];
-  systemInstruction?: string;
-  thinkingDepth?: 'fast' | 'expert' | 'deep';
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  profile?: UserProfile;
+  memories?: MemoryItem[];
+  thinkingDepth?: ThinkingDepth;
   webSearch?: boolean;
   image?: {
     mimeType: string;
@@ -56,19 +29,105 @@ interface ChatRequestBody {
 
 interface LearnRequestBody {
   userMessage: string;
-  assistantMessage: string;
   existingMemories?: Array<{ category: string; content: string }>;
+}
+
+async function detectLocalOllamaModel(): Promise<string | null> {
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/tags`, {
+      signal: AbortSignal.timeout(500),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { models?: Array<{ name: string }> };
+    const models = data.models ?? [];
+    if (models.length === 0) return null;
+    if (OLLAMA_MODEL && models.some((m) => m.name === OLLAMA_MODEL)) {
+      return OLLAMA_MODEL;
+    }
+    return models[0].name;
+  } catch {
+    return null;
+  }
+}
+
+async function streamWithLocalOllama(params: {
+  model: string;
+  userMessage: string;
+  systemInstruction: string;
+  webContext: string;
+  imageBase64?: string;
+  onChunk: (text: string) => void;
+}): Promise<string> {
+  const prompt = params.webContext
+    ? `Información investigada en la web en tiempo real:\n${params.webContext}\n\nConsulta del usuario:\n${params.userMessage}`
+    : params.userMessage;
+
+  const res = await fetch(`${OLLAMA_URL}/api/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: params.model,
+      system: params.systemInstruction,
+      prompt,
+      stream: true,
+      ...(params.imageBase64 ? { images: [params.imageBase64] } : {}),
+    }),
+  });
+
+  if (!res.ok || !res.body) {
+    throw new Error(`Ollama local respondió ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullText = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line) as { response?: string };
+        if (parsed.response) {
+          fullText += parsed.response;
+          params.onChunk(parsed.response);
+        }
+      } catch {
+        // Ignore partial JSON line
+      }
+    }
+  }
+
+  return fullText;
 }
 
 async function createServer() {
   const app = express();
   app.use(express.json({ limit: '15mb' }));
 
-  app.get('/api/health', (_req, res) => {
+  // Allow Capacitor / local mobile origins cleanly
+  app.use('/api', (_req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (_req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  app.get('/api/health', async (_req, res) => {
+    const localModel = await detectLocalOllamaModel();
     res.json({
       ok: true,
-      model: 'gemini-4-hydrogen',
-      hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+      engine: localModel ? `ollama:${localModel}+web` : 'keyless-web-research',
+      requiresApiKey: false,
     });
   });
 
@@ -90,178 +149,72 @@ async function createServer() {
         return;
       }
 
-      const ai = getAiClient();
-      const history = Array.isArray(body.history) ? body.history.slice(-14) : [];
-      type ContentPart = { text: string } | { inlineData: { mimeType: string; data: string } };
-      const contents: Array<{ role: 'user' | 'model'; parts: ContentPart[] }> = history.map((item) => ({
-        role: item.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: item.content }],
-      }));
+      const profile = body.profile ? { ...DEFAULT_PROFILE, ...body.profile } : DEFAULT_PROFILE;
+      const memories = Array.isArray(body.memories) ? body.memories : [];
+      const depth: ThinkingDepth = body.thinkingDepth || 'expert';
+      const webEnabled = body.webSearch !== false;
 
-      const userParts: ContentPart[] = [];
-      if (body.image?.base64Data && body.image?.mimeType) {
-        userParts.push({
-          inlineData: {
-            mimeType: body.image.mimeType,
-            data: body.image.base64Data,
-          },
-        });
-      }
-      userParts.push({
-        text: userMessage || 'Analiza esta imagen con precisión técnica.',
+      const research = await runWebResearch({
+        query: userMessage || 'Análisis visual local',
+        depth,
+        webEnabled,
+        profile,
+        memories,
+        allowDirectUrlFetch: true,
       });
 
-      contents.push({
-        role: 'user',
-        parts: userParts,
-      });
-
-      const urls = extractUrls(userMessage);
-      const tools: Array<{ googleSearch?: Record<string, never>; urlContext?: Record<string, never> }> = [];
-      if (body.webSearch) {
-        tools.push({ googleSearch: {} });
-      }
-      if (urls.length > 0) {
-        tools.push({ urlContext: {} });
-      }
-
-      const stream = await ai.models.generateContentStream({
-        model: 'gemini-4-hydrogen',
-        contents,
-        config: {
-          systemInstruction:
-            typeof body.systemInstruction === 'string' && body.systemInstruction.trim().length > 0
-              ? body.systemInstruction
-              : 'Eres Nexus Edge, un asistente personal experto, directo y eficiente.',
-          thinkingConfig: {
-            thinkingLevel: mapThinkingDepth(body.thinkingDepth),
-          },
-          ...(tools.length > 0 ? { tools } : {}),
-        },
-      });
-
-      const sourcesMap = new Map<string, { uri: string; title: string }>();
+      const localModel = await detectLocalOllamaModel();
       let fullText = '';
 
-      for await (const chunk of stream) {
-        const textPart = chunk.text;
-        if (textPart) {
-          fullText += textPart;
-          sendEvent('chunk', { text: textPart });
+      if (localModel) {
+        const webContext = research.findings
+          .map((f) => `[${f.sourceTitle} (${f.sourceUrl})]\n${f.excerpts.join('\n')}`)
+          .join('\n\n');
+        const systemInstruction = buildAdaptiveSystemPrompt(profile, memories, null);
+        fullText = await streamWithLocalOllama({
+          model: localModel,
+          userMessage: userMessage || 'Analiza esta imagen con precisión.',
+          systemInstruction,
+          webContext,
+          imageBase64: body.image?.base64Data,
+          onChunk: (chunk) => sendEvent('chunk', { text: chunk }),
+        });
+      } else {
+        if (body.image && !userMessage) {
+          fullText =
+            'Para analizar imágenes sin APIs externas, ejecuta un modelo de visión local con Ollama en UserLAnd (por ejemplo `ollama run moondream`) o escribe tu consulta junto a la imagen para investigarla en la web.';
+        } else {
+          fullText = research.markdown;
         }
-
-        const groundingChunks = chunk.candidates?.[0]?.groundingMetadata?.groundingChunks;
-        if (Array.isArray(groundingChunks)) {
-          for (const g of groundingChunks) {
-            const uri = g.web?.uri;
-            if (uri && !sourcesMap.has(uri)) {
-              sourcesMap.set(uri, {
-                uri,
-                title: g.web?.title || uri,
-              });
-            }
-          }
-        }
+        sendEvent('chunk', { text: fullText });
       }
 
       sendEvent('done', {
         fullText,
-        sources: Array.from(sourcesMap.values()),
+        sources: research.sources,
       });
       res.end();
     } catch (err: unknown) {
-      const errorObj = err as { message?: string; status?: number };
-      const raw = errorObj?.message || 'Error al comunicarse con el motor de IA.';
-      let friendly = raw;
-      if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
-        friendly =
-          'Límite de cuota de Gemini API alcanzado (429). Verifica tu clave y cuota en Settings > Secrets.';
-      } else if (raw.includes('403') || raw.includes('PERMISSION_DENIED') || raw.includes('API_KEY_INVALID')) {
-        friendly =
-          'Clave de Gemini API inválida o sin permisos. Verifica GEMINI_API_KEY en Settings > Secrets.';
-      } else if (raw.includes('404') || raw.includes('NOT_FOUND')) {
-        friendly = 'El modelo Gemini solicitado no está disponible actualmente (404).';
-      }
-      sendEvent('error', { message: friendly });
+      const errorObj = err as { message?: string };
+      sendEvent('error', {
+        message: errorObj?.message || 'Error al investigar en la web en tiempo real.',
+      });
       res.end();
     }
   });
 
-  app.post('/api/learn', async (req, res) => {
-    try {
-      const body = req.body as LearnRequestBody;
-      if (!body?.userMessage || !body?.assistantMessage) {
-        res.status(400).json({ error: 'Se requiere userMessage y assistantMessage.' });
-        return;
-      }
-
-      const ai = getAiClient();
-      const existingSummary = Array.isArray(body.existingMemories)
-        ? body.existingMemories
-            .slice(0, 20)
-            .map((m) => `[${m.category}] ${m.content}`)
-            .join('\n')
-        : '';
-
-      const prompt = [
-        'Analiza el intercambio reciente y extrae SOLO aprendizajes duraderos y útiles sobre el usuario.',
-        'Categorías permitidas: preference (preferencias de flujo o formato), style (estilo de comunicación), goal (objetivos a largo plazo), fact (hechos/contexto del usuario o sus proyectos).',
-        'No inventes datos. Si no hay nada nuevo o relevante, devuelve un arreglo vacío.',
-        existingSummary ? `\nMemorias existentes:\n${existingSummary}` : '',
-        `\nMensaje del usuario:\n${body.userMessage}`,
-        `\nRespuesta del asistente:\n${body.assistantMessage.slice(0, 1500)}`,
-      ].join('\n');
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: prompt,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              insights: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    category: {
-                      type: Type.STRING,
-                      description: 'Uno de: preference, style, goal, fact',
-                    },
-                    content: {
-                      type: Type.STRING,
-                      description: 'Descripción concisa en español (máximo 140 caracteres).',
-                    },
-                    confidence: {
-                      type: Type.NUMBER,
-                      description: 'Confianza entre 0.5 y 1.0',
-                    },
-                  },
-                  required: ['category', 'content', 'confidence'],
-                },
-              },
-            },
-            required: ['insights'],
-          },
-        },
-      });
-
-      const parsed = JSON.parse((response.text ?? '{"insights":[]}').trim()) as {
-        insights?: Array<{ category: string; content: string; confidence: number }>;
-      };
-
-      const validCategories = new Set(['preference', 'style', 'goal', 'fact']);
-      const insights = (parsed.insights ?? []).filter(
-        (item) => validCategories.has(item.category) && typeof item.content === 'string' && item.content.trim().length > 5
-      );
-
-      res.json({ insights });
-    } catch (err: unknown) {
-      const errorObj = err as { message?: string };
-      res.status(500).json({ error: errorObj?.message || 'Error al analizar aprendizaje continuo.' });
+  app.post('/api/learn', (req, res) => {
+    const body = req.body as LearnRequestBody;
+    if (!body?.userMessage) {
+      res.status(400).json({ error: 'Se requiere userMessage.' });
+      return;
     }
+
+    const insights = extractLocalInsights(
+      body.userMessage,
+      Array.isArray(body.existingMemories) ? body.existingMemories : []
+    );
+    res.json({ insights });
   });
 
   if (process.env.NODE_ENV !== 'production') {
@@ -280,7 +233,7 @@ async function createServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Nexus Edge server listening on http://0.0.0.0:${PORT}`);
+    console.log(`Nexus Edge server (keyless web research) listening on http://0.0.0.0:${PORT}`);
   });
 }
 

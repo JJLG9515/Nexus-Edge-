@@ -99,7 +99,7 @@ export const VaultView: React.FC<VaultViewProps> = ({
                 Arquitectura de privacidad y límites operativos
               </h2>
               <p className="text-xs text-slate-300 leading-relaxed">
-                Las conversaciones y memorias se almacenan únicamente en el navegador del teléfono. Las consultas de razonamiento y búsqueda web en tiempo real se procesan a través de la API de Gemini en el servidor de esta instancia privada, manteniendo las salvaguardas estándar de seguridad.
+                Tus conversaciones, preferencias y memoria residen únicamente en el almacenamiento local del dispositivo, sin cuentas externas ni claves de API requeridas. La investigación en tiempo real consulta fuentes web abiertas y, si ejecutas Ollama localmente en UserLAnd, puede sintetizar las respuestas en tu propio hardware.
               </p>
             </div>
           </div>

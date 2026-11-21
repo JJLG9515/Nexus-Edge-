@@ -5,7 +5,7 @@ import type {
   MemoryItem,
   UserProfile,
   VaultExport,
-} from '../types';
+} from '../types.ts';
 
 export const DEFAULT_PROFILE: UserProfile = {
   ownerName: 'Propietario',
